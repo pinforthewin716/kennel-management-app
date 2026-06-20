@@ -16,8 +16,8 @@ import {
 } from './types';
 
 export * from './types';
-export { OcrProvider } from './providers/ocr';
-export { VetVerifiProvider } from './providers/vetverifi';
+export { OcrProvider, type OcrEngine } from './providers/ocr';
+export { VetVerifiProvider, type VetVerifiStatus } from './providers/vetverifi';
 
 /** Pick the most-automated provider that's actually usable for this request. */
 export function resolveProvider(
