@@ -1,56 +1,96 @@
 // poodleOS — VetVerifi provider adapter
 //
-// STATUS: SHELL — pending the real VetVerifi API contract.
-// VetVerifi is an aggregator that delivers VERIFIED vaccine records to pet-service
-// businesses and already integrates with Gingr/PetExec (one integration → 30+ vet
-// PIMS). Their API auth/endpoints/fields and partner-onboarding terms are NOT yet
-// confirmed (recon in progress: library file VetVerifi-API-Integration-Recon.md).
+// VetVerifi is a partner-gated aggregator that delivers VERIFIED vaccine records
+// pulled directly from SmartTag-enrolled vet clinics' PIMS (NOT owner uploads —
+// that's the OCR provider's job). Endpoints below are CONFIRMED from VetVerifi's
+// docs; the response FIELD SCHEMA and exact auth-header format are behind the
+// partner gate and arrive after onboarding (apply at vetverifi.com/api-access,
+// ~2 business days). See library: VetVerifi-API-Integration-Recon.md.
 //
-// Do NOT mark this provider configured/working until the real contract is filled
-// in below. Everything inside fetchRecords is a documented PLACEHOLDER, not a
-// verified call. This keeps the seam ready without shipping a guessed integration.
+// STATUS: endpoints wired; response→record mapping is TODO until partner creds +
+// schema land. isConfigured() stays false until an API key is set, so the
+// registry falls back to OCR in the meantime.
 
 import {
   type FetchInput,
   type PetVaccineStatus,
+  type VaccinationRecord,
   type VaccineRecordProvider,
   ConsentRequiredError,
   ProviderNotConfiguredError,
 } from '../types';
 
+/** VetVerifi's public verification status enum (CONFIRMED). */
+export type VetVerifiStatus = 'Verified' | 'Pending' | 'Expired';
+
 export interface VetVerifiConfig {
-  apiKey?: string;       // from env: VETVERIFI_API_KEY (set once partner creds obtained)
-  baseUrl?: string;      // CONFIRM: VetVerifi API base URL (recon)
+  apiKey?: string;                 // env: VETVERIFI_API_KEY (issued after partner approval)
+  baseUrl?: string;                // default below is INFERRED — confirm at onboarding
+  fetchImpl?: typeof fetch;        // injectable for tests
 }
+
+const DEFAULT_BASE_URL = 'https://api.vetverifi.com/v1'; // INFERRED from docs copy
 
 export class VetVerifiProvider implements VaccineRecordProvider {
   readonly name = 'vetverifi' as const;
-  readonly requiresConsent = true;
+  readonly requiresConsent = true; // clinic record-release; owner authorization mediated by VetVerifi/clinic — confirm capture at onboarding
 
-  constructor(private cfg: VetVerifiConfig = {}) {}
+  private readonly baseUrl: string;
+  private readonly doFetch: typeof fetch;
 
-  isConfigured(): boolean {
-    // Intentionally requires BOTH a key and a confirmed base URL. Until recon
-    // fills baseUrl, this returns false and the registry falls back to OCR.
-    return Boolean(this.cfg.apiKey && this.cfg.baseUrl);
+  constructor(private cfg: VetVerifiConfig = {}) {
+    this.baseUrl = cfg.baseUrl ?? DEFAULT_BASE_URL;
+    this.doFetch = cfg.fetchImpl ?? fetch;
   }
 
+  isConfigured(): boolean {
+    return Boolean(this.cfg.apiKey);
+  }
+
+  private headers(): Record<string, string> {
+    // CONFIRM exact scheme at onboarding (bearer assumed from "drop your API key" docs).
+    return { Authorization: `Bearer ${this.cfg.apiKey}`, 'Content-Type': 'application/json' };
+  }
+
+  /** POST /verify — run a verification for a pet (CONFIRMED endpoint). */
   async fetchRecords(input: FetchInput): Promise<PetVaccineStatus> {
     if (!this.isConfigured()) throw new ProviderNotConfiguredError(this.name);
     if (!input.consent || input.consent.revokedAt) throw new ConsentRequiredError(input.petId);
 
-    // ── PLACEHOLDER — replace with the real, recon-confirmed VetVerifi call ──
-    // Expected (to verify): authenticated request keyed by pet/owner/clinic hint,
-    // returning verified vaccination entries we map into VaccinationRecord[].
-    //
-    //   const res = await fetch(`${this.cfg.baseUrl}/<CONFIRM_ENDPOINT>`, {
-    //     headers: { Authorization: `Bearer ${this.cfg.apiKey}` },
-    //     ...
-    //   });
-    //   return mapVetVerifiResponse(await res.json(), input.petId);
-    //
-    throw new Error(
-      'VetVerifiProvider.fetchRecords not implemented — awaiting confirmed API contract (see recon doc).',
-    );
+    const res = await this.doFetch(`${this.baseUrl}/verify`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ petId: input.petId, ...input.hints }), // CONFIRM request body fields
+    });
+    if (!res.ok) throw new Error(`VetVerifi /verify failed: ${res.status} ${res.statusText}`);
+    return mapVerifyResponse(await res.json(), input.petId);
   }
+
+  /** GET /verify/refresh — re-check at check-in (CONFIRMED endpoint). */
+  async refresh(petId: string): Promise<PetVaccineStatus> {
+    if (!this.isConfigured()) throw new ProviderNotConfiguredError(this.name);
+    const res = await this.doFetch(`${this.baseUrl}/verify/refresh?petId=${encodeURIComponent(petId)}`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error(`VetVerifi /verify/refresh failed: ${res.status}`);
+    return mapVerifyResponse(await res.json(), petId);
+  }
+}
+
+/**
+ * Map VetVerifi's verification status to our enum. The per-vaccine record FIELD
+ * SHAPE is gated (UNKNOWN until onboarding) — only the top-level status enum is
+ * public, so we surface status now and fill `records` once the schema is confirmed.
+ */
+export function mapVerifyResponse(raw: unknown, petId: string): PetVaccineStatus {
+  const status = (raw as { status?: VetVerifiStatus })?.status;
+  // TODO(partner-schema): map raw.records[] → VaccinationRecord[] once VetVerifi
+  // provides the normalized record schema after partner approval.
+  const records: VaccinationRecord[] = [];
+  return {
+    petId,
+    records,
+    retrievedAt: new Date().toISOString(),
+    provider: status ? `vetverifi:${status}` : 'vetverifi',
+  };
 }
